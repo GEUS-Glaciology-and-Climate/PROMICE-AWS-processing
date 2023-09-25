@@ -6,8 +6,12 @@ import numpy as np
 import urllib.request
 from urllib.error import HTTPError, URLError
 import pandas as pd
+import subprocess
 import os
 import xarray as xr
+import sqlite3
+
+# from IPython import embed
 
 def toL2(L1, T_0=273.15, ews=1013.246, ei0=6.1071, eps_overcast=1., 
          eps_clear=9.36508e-6, emissivity=0.97):
@@ -45,7 +49,14 @@ def toL2(L1, T_0=273.15, ews=1013.246, ei0=6.1071, eps_overcast=1.,
     except Exception as e: 
         print('Flagging and fixing failed:')
         print(e)
+        
+    #stid = ds.station_id
     
+    
+    
+    ds = differenceQC(ds)                                                      # Flag and Remove difference outliers     
+    ds = percentileQC(ds)                                                      # Flag and remove percentile outliers
+
     T_100 = _getTempK(T_0)  
     ds['rh_u_cor'] = correctHumidity(ds['rh_u'], ds['t_u'],  
                                      T_0, T_100, ews, ei0)                       
@@ -146,6 +157,248 @@ def toL2(L1, T_0=273.15, ews=1013.246, ei0=6.1071, eps_overcast=1.,
             ds['rh_i_cor'] = correctHumidity(ds['rh_i'], ds['t_i'],       # Correct relative humidity
                                              T_0, T_100, ews, ei0)                   
     return ds
+
+def differenceQC(ds):
+    '''
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+         Level 1 datset
+         
+    Returns
+    -------
+    ds_out : xr.Dataset
+            Level 1 dataset with difference outliers set to NaN
+    '''
+    
+    # the differenceQC is not done on the Windspeed
+    # Optionally examine flagged data by setting make_plots to True
+    # This is best done by running aws.py directly and setting 'test_station'
+    # Plots will be shown before and after flag removal for each var
+
+    stid = ds.station_id
+    df = ds.to_dataframe() # Switch to pandas
+    
+    # Define threshold dict to hold limit values, and the difference values.
+    # Limit values indicate how much a variable has to change to the previous value
+    # diff_period is how many hours a value can stay the same without being set to NaN 
+    # * are used to calculate and define all limits, which are then applied to *_u, *_l and *_i
+    
+    var_threshold = {
+        't': {'static_limit': 0.001, 'diff_period' : 1}, 
+        'p': {'static_limit': 0.0001, 'diff_period' : 24},
+        'rh': {'static_limit': 0.0001, 'diff_period' : 24}
+        }
+
+    
+    for k in var_threshold.keys():
+        
+         var_all = [k + '_u',k + '_l',k + '_i'] # apply to upper, lower boom, and instant
+         static_lim = var_threshold[k]['static_limit'] # loading static limit
+         diff_h = var_threshold[k]['diff_period'] # loading diff period
+         
+         for v in var_all:
+             if v in df:
+                
+                data = df[v]
+                diff = data.diff()
+                diff.fillna(method='ffill', inplace=True) # forward filling all NaNs! 
+                diff = np.array(diff)
+
+                diff_period = np.ones_like(diff) * False
+                
+                for i,d in enumerate(diff): # algorithm that ensures values can stay the same within the diff_period
+                    if i > (diff_h-1): 
+                        if sum(abs(diff[i-diff_h:i])) < static_lim:
+                            diff_period[i-diff_h:i] = True
+                
+                diff_period = np.array(diff_period).astype('bool')
+                
+                outliers = df[v][diff_period] # finding outliers in dataframe
+                
+                df.loc[outliers.index,v] = np.nan # setting outliers to NaN
+                
+    # Back to xarray, and re-assign the original attrs
+    ds_out = df.to_xarray()
+    ds_out = ds_out.assign_attrs(ds.attrs) # Dataset attrs
+    for x in ds_out.data_vars: # variable-specific attrs
+        ds_out[x].attrs = ds[x].attrs
+    # equivalent to above:
+    # vals = [xr.DataArray(data=df_out[c], dims=['time'], coords={'time':df_out.index}, attrs=ds[c].attrs) for c in df_out.columns]
+    # ds_out = xr.Dataset(dict(zip(df_out.columns, vals)), attrs=ds.attrs)
+    return ds_out
+    
+
+def percentileQC(ds):
+    '''
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Level 1 dataset
+
+    Returns
+    -------
+    ds_out : xr.Dataset
+        Level 1 dataset with percentile outliers set to NaN
+    '''
+    # Check if on-disk sqlite db exists
+    # If it not exists, then run compute_percentiles.py
+    
+    base_path = os.getcwd()
+    
+    file_path1 =  base_path + '/main/src/pypromice/qc/percentiles.db'
+    file_path2 =  base_path + '/qc/percentiles.db'
+   
+    script_path1 = base_path + '/main/src/pypromice/qc/compute_percentiles.py'
+    script_path2 = base_path + '/qc/compute_percentiles.py'
+    
+    script_exist1 = os.path.isfile(script_path1)
+    
+    db_exist1 = os.path.isfile(file_path1)
+    db_exist2 = os.path.isfile(file_path2)
+
+    
+    print(f'Does percentiles.db exist {db_exist2} in this path {file_path2}')    
+    
+    
+    if not db_exist1 and not db_exist2:
+        if script_exist1: 
+            print(f'percentiles.db does not exist running {script_path1}')
+            subprocess.call(['python',script_path1])
+            file_path = file_path1
+        else:
+            print(f'percentiles.db does not exist running {script_path2}')
+            subprocess.call(['python',script_path2])
+            file_path = file_path2
+        
+    # Optionally examine flagged data by setting make_plots to True
+    # This is best done by running aws.py directly and setting 'test_station'
+    # Plots will be shown before and after flag removal for each var
+    make_plots = False
+
+    stid = ds.station_id
+    stid_type = type(stid)
+    
+    print(f'station id {stid}')
+    print(f'station id type {stid_type}')
+    df = ds.to_dataframe() # Switch to pandas
+
+    # Define threshold dict to hold limit values, and 'hi' and 'lo' percentile.
+    # Limit values indicate how far we will go beyond the hi and lo percentiles to flag outliers.
+    # *_u are used to calculate and define all limits, which are then applied to *_u, *_l and *_i
+    var_threshold = {
+        't_u': {'limit': 9}, # 'hi' and 'lo' will be held in 'seasons' dict
+        'p_u': {'limit': 12},
+        'rh_u': {'limit': 12},
+        'wspd_u': {'limit': 12},
+        }
+    
+    # Query from the on-disk sqlite db for specified percentiles
+    if db_exist1:        
+        file_path = file_path1
+    else: 
+        file_path = file_path2
+        
+    con = sqlite3.connect(file_path)
+    cur = con.cursor()
+    for k in var_threshold.keys():
+        if k == 't_u':
+            # Different pattern for t_u, which considers seasons
+            # 1: winter (DecJanFeb), 2: spring (MarAprMay), 3: summer (JunJulAug), 4: fall (SepOctNov)
+            seasons = {1: {}, 2: {}, 3: {}, 4: {}}
+            sql = f"SELECT p0p5,p99p5,season FROM {k} WHERE season in (1,2,3,4) and stid = ?"
+            cur.execute(sql, [stid])
+            result = cur.fetchall()
+            if result:
+                for row in result:  
+                    # row[0] is p0p5, row[1] is p99p5, row[2] is the season integer
+                    seasons[row[2]]['lo'] = row[0] # 0.005
+                    seasons[row[2]]['hi'] = row[1] # 0.995
+                    var_threshold[k]['seasons'] = seasons
+            else:
+               print(f'{stid} has no {k} data')
+        else:
+            sql = f"SELECT p0p5,p99p5 FROM {k} WHERE stid = ?"
+            cur.execute(sql, [stid])
+            result = cur.fetchone() # we only expect one row back per station
+            if result: 
+                var_threshold[k]['lo'] = result[0] # 0.005
+                var_threshold[k]['hi'] = result[1] # 0.995
+            else:
+               print(f'{stid} has no {k} data')
+               
+    con.close() # close the database connection (and cursor)
+
+    # Set flagged data to NaN
+    for k in var_threshold.keys():
+        if k == 't_u':
+            # use t_u thresholds to flag t_u, t_l, t_i
+            base_var = k.split('_')[0]
+            vars_all = [k, base_var+'_l', base_var+'_i']
+            for t in vars_all:
+                if t in df:
+                    winter = df[t][df.index.month.isin([12,1,2])]
+                    spring = df[t][df.index.month.isin([3,4,5])]
+                    summer = df[t][df.index.month.isin([6,7,8])]
+                    fall = df[t][df.index.month.isin([9,10,11])]
+                    season_dfs = [winter,spring,summer,fall]
+
+                    if make_plots:
+                        _plot_percentiles_t(k,t,df,season_dfs,var_threshold,stid) # BEFORE OUTLIER REMOVAL
+                    for x1,x2 in zip([1,2,3,4], season_dfs):
+                        try:
+                            print(f'percentile flagging {t} {x1}')
+                            lower_thresh = var_threshold[k]['seasons'][x1]['lo'] - var_threshold[k]['limit']
+                            upper_thresh = var_threshold[k]['seasons'][x1]['hi'] + var_threshold[k]['limit']
+                            outliers_upper = x2[x2.values > upper_thresh]
+                            outliers_lower = x2[x2.values < lower_thresh]
+                            outliers = pd.concat([outliers_upper,outliers_lower])
+                            df.loc[outliers.index,t] = np.nan
+                            df.loc[outliers.index,t] = np.nan
+                        except Exception as e:
+                            print(f'{t} Season {x1} is not computed due to lack of data')
+                            print(e)
+                    if make_plots:
+                        _plot_percentiles_t(k,t,df,season_dfs,var_threshold,stid) # AFTER OUTLIER REMOVAL
+        else:
+            # use *_u thresholds to flag *_u, *_l, *_i
+            base_var = k.split('_')[0]
+            vars_all = [k, base_var+'_l', base_var+'_i']
+            for t in vars_all:
+                if t in df:
+                    try:
+                        print(f'percentile flagging {t}')
+                        upper_thresh = var_threshold[k]['hi'] + var_threshold[k]['limit']
+                        lower_thresh = var_threshold[k]['lo'] - var_threshold[k]['limit']
+                        if make_plots:
+                            _plot_percentiles(k,t,df,var_threshold,upper_thresh,lower_thresh,stid) # BEFORE OUTLIER REMOVAL
+                        if t == 'p_i':
+                            # shift p_i so we can use the p_u thresholds
+                            shift_p = df[t]+1000.
+                            outliers_upper = shift_p[shift_p.values > upper_thresh]
+                            outliers_lower = shift_p[shift_p.values < lower_thresh]
+                        else:
+                            outliers_upper = df[t][df[t].values > upper_thresh]
+                            outliers_lower = df[t][df[t].values < lower_thresh]
+                        outliers = pd.concat([outliers_upper,outliers_lower])
+                        df.loc[outliers.index,t] = np.nan
+                        df.loc[outliers.index,t] = np.nan
+                    except Exception as e:
+                        print(f'{t} is not flagged due to lack of data')
+                        print(e)
+                    if make_plots:
+                        _plot_percentiles(k,t,df,var_threshold,upper_thresh,lower_thresh,stid) # AFTER OUTLIER REMOVAL
+
+    # Back to xarray, and re-assign the original attrs
+    ds_out = df.to_xarray()
+    ds_out = ds_out.assign_attrs(ds.attrs) # Dataset attrs
+    for x in ds_out.data_vars: # variable-specific attrs
+        ds_out[x].attrs = ds[x].attrs
+    # equivalent to above:
+    # vals = [xr.DataArray(data=df_out[c], dims=['time'], coords={'time':df_out.index}, attrs=ds[c].attrs) for c in df_out.columns]
+    # ds_out = xr.Dataset(dict(zip(df_out.columns, vals)), attrs=ds.attrs)
+    return ds_out
 
 def flagNAN(ds_in, 
             flag_url='https://raw.githubusercontent.com/GEUS-Glaciology-and-Climate/PROMICE-AWS-data-issues/master/flags/',
@@ -1017,6 +1270,51 @@ def _getRotation():                                                            #
     deg2rad = np.pi / 180
     rad2deg = 1 / deg2rad
     return deg2rad, rad2deg
+
+def _plot_percentiles_t(k, t, df, season_dfs, var_threshold, stid):
+    '''Plot data and percentile thresholds for air temp (seasonal)'''
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(20,12))
+    inst_var = t.split('_')[0] + '_i'
+    if inst_var in df:
+        i_plot = df[inst_var]
+        plt.scatter(df.index,i_plot, color='orange', s=3, label='t_i instantaneuous')
+    if t in ('t_u','t_l'):
+        plt.scatter(df.index,df[t], color='b', s=3, label=f'{t} hourly ave')
+    for x1,x2 in zip([1,2,3,4], season_dfs):
+        y1 = np.full(len(x2.index), (var_threshold[k]['seasons'][x1]['lo'] - var_threshold[k]['limit']))
+        y2 = np.full(len(x2.index), (var_threshold[k]['seasons'][x1]['hi'] + var_threshold[k]['limit']))
+        y11 = np.full(len(x2.index), (var_threshold[k]['seasons'][x1]['lo'] ))
+        y22 = np.full(len(x2.index), (var_threshold[k]['seasons'][x1]['hi'] ))
+        plt.scatter(x2.index, y1, color='r',s=1)
+        plt.scatter(x2.index, y2, color='r', s=1)
+        plt.scatter(x2.index, y11, color='k', s=1)
+        plt.scatter(x2.index, y22, color='k', s=1)
+    plt.title('{} {}'.format(stid, t))
+    plt.legend(loc="lower left")
+    plt.show()
+
+def _plot_percentiles(k, t, df, var_threshold, upper_thresh, lower_thresh, stid):
+    '''Plot data and percentile thresholds'''
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(20,12))
+    inst_var = t.split('_')[0] + '_i'
+    if inst_var in df:
+        if k == 'p_u':
+            i_plot = (df[inst_var]+1000.)
+        else:
+            i_plot = df[inst_var]
+        plt.scatter(df.index,i_plot, color='orange', s=3, label='instantaneuous')
+    if t != inst_var:
+        plt.scatter(df.index,df[t], color='b', s=3, label=f' {t} hourly ave')
+    plt.axhline(y=upper_thresh, color='r', linestyle='-')
+    plt.axhline(y=lower_thresh, color='r', linestyle='-')
+    plt.axhline(y=var_threshold[k]['hi'], color='k', linestyle='--')
+    plt.axhline(y=var_threshold[k]['lo'], color='k', linestyle='--')
+    plt.title('{} {}'.format(stid, t))
+    plt.legend(loc="lower left")
+    plt.show()
+
 
 if __name__ == "__main__": 
     # unittest.main() 
