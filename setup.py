@@ -32,8 +32,10 @@ setuptools.setup(
     python_requires=">=3.8",
     package_data={
         "pypromice.qc.percentiles": ["thresholds.csv"],
-        "pypromice.process": ["variables.csv"],
-    },
+        "pypromice.process": ["*.csv"],
+        "pypromice.tx": ["*.csv"],
+        "pypromice": ["test/*"],
+        },
     install_requires=[
         'numpy>=1.23.0',
         'pandas>=1.5.0',
