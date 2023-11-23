@@ -47,9 +47,13 @@ $ pip install .
 
 ### Additional dependencies
 
-Additional packages are required if you wish to use pypromice's post-processing functionality. 
+[eccodes](https://confluence.ecmwf.int/display/ECC/ecCodes+installation) is the official package for BUFR encoding and decoding. This is needed if you wish to use pypromice's post-processing functionality. You can install this with pypromice like this:
 
-[eccodes](https://confluence.ecmwf.int/display/ECC/ecCodes+installation) is the official package for BUFR encoding and decoding. Try firstly to install with conda-forge like so:
+```
+$ pip install pypromice[full]
+```
+
+Or install eccodes separately: 
 
 ```
 $ conda install -c conda-forge eccodes

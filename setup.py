@@ -48,6 +48,10 @@ setuptools.setup(
         'pyDataverse',
         'eccodes',
     ],
+    extras_require={
+    	'all':['eccodes']
+    	},
+    	
     entry_points={
     'console_scripts': [
         'get_promice_data = pypromice.get.get_promice_data:get_promice_data',
